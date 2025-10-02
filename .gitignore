@@ -1,0 +1,25 @@
+# Ignore virtual environments
+.venv/
+.venv_py38/
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# VSCode or PyCharm settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+
+# Logs and temp
+*.log
+*.tmp
+
+# Application specific
+config/credentials.json
+config/client_secret.json
+token.json
+credentials.json
