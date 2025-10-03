@@ -10,23 +10,17 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG) 
 
 # --- 1. SETUP: SPACY MODEL LOADING ---
-print(f"DEBUG: Attempting to load spaCy model 'en_core_web_lg' from {__file__}")
-
 nlp = None
 try:
     nlp = spacy.load('en_core_web_lg') 
-    logger.info("spaCy model 'en_core_web_lg' loaded successfully.")
 except Exception as e:
-    logger.warning(f"Could not load spaCy model 'en_core_web_lg': {e}. Falling back to 'en_core_web_sm'.")
     try:
         nlp = spacy.load('en_core_web_sm') 
-        logger.info("spaCy model 'en_core_web_sm' loaded successfully.")
     except Exception as e_sm:
-        logger.error(f"Could not load spaCy model 'en_core_web_sm'. Please ensure it's installed: {e_sm}")
+        logger.error(f"Could not load spaCy model. Please ensure it's installed.")
         nlp = None 
 
 # Assuming this module exists in your project structure
-# Replace this with a placeholder to avoid breaking the code if the module is missing
 class MockTextExtractor:
     @staticmethod
     def extract_text_from_resume(bytes_, filename):
@@ -35,7 +29,6 @@ try:
     from src.resume_parser import text_extractor 
 except ImportError:
     text_extractor = MockTextExtractor()
-    logger.warning("Using MockTextExtractor as src.resume_parser.text_extractor could not be imported.")
 
 # --- 2. HELPER FUNCTIONS ---
 
@@ -58,6 +51,7 @@ def extract_phone_number(text: str) -> Optional[str]:
     potential_numbers = []
     for match in phone_regex.finditer(text):
         found_num = match.group(0) 
+        # Robust cleaning
         cleaned_num = re.sub(r'[^\d+()-.\s]', '', found_num).strip()
         digits_only = re.sub(r'\D', '', cleaned_num) 
         if 7 <= len(digits_only) <= 15:
@@ -81,11 +75,9 @@ def extract_email_address(text: str) -> Optional[str]:
 
 def extract_name_with_spacy(text: str) -> Optional[str]:
     global nlp 
-
     if nlp is None:
         logger.warning("spaCy model not loaded, cannot extract name with spaCy.")
         return None
-
     doc = nlp(text[:2048]) 
     for ent in doc.ents:
         if ent.label_ == "PERSON":
@@ -94,12 +86,53 @@ def extract_name_with_spacy(text: str) -> Optional[str]:
     logger.debug("No PERSON entity found with spaCy NER from full text.")
     return None
 
+def aggressively_despace_name(text: str) -> Optional[str]:
+    """Handles names with excessive single-space spacing (A D R I A N) or concatenated names."""
+    words = text.split()
+    
+    # Heuristic 1: Single-letter spacing (A D R I A N S H A L A)
+    if len(words) >= 4 and all(len(word) <= 2 and word.isupper() for word in words):
+        merged_name = "".join(words)
+        for split in range(4, min(10, len(merged_name) - 3)):
+            candidate_with_space = merged_name[:split] + " " + merged_name[split:]
+            if is_valid_name_format(candidate_with_space):
+                logger.debug(f"Aggressively de-spaced, inserted space, and validated name: '{candidate_with_space}'")
+                return candidate_with_space.title()
+    
+    # Heuristic 2: Concatenated Name (used for file names)
+    if len(words) == 1 and len(text) > 7:
+        merged_name = text.lower()
+        for split in range(4, min(9, len(merged_name) - 3)):
+            candidate_with_space = merged_name[:split].title() + " " + merged_name[split:].title()
+            if is_valid_name_format(candidate_with_space):
+                logger.debug(f"Aggressively de-spaced, split and validated concatenated string: '{candidate_with_space}'")
+                return candidate_with_space
+            
+    return None
+
+def extract_name_from_filename(filename: str) -> Optional[str]:
+    """Extracts a name from the filename by cleaning non-name parts and separators."""
+    name_part = Path(filename).stem
+    name_part = re.sub(r'(?i)CV|RESUME|PORTFOLIO|DOKUMENT|(?:\s*\(\d+\))|\d{4,}', ' ', name_part).strip()
+    cleaned_name = re.sub(r'[\s\._-]+', ' ', name_part).strip()
+    
+    if is_valid_name_format(cleaned_name):
+        logger.debug(f"Validated name from filename: '{cleaned_name}'")
+        return cleaned_name.title()
+    
+    if len(cleaned_name.split()) == 1:
+        concatenated_split = aggressively_despace_name(cleaned_name)
+        if concatenated_split:
+            return concatenated_split
+        
+    return None
+
+
 def is_valid_name_format(name_candidate: str) -> bool:
     """Uses nameparser to check if a string has a recognizable first and last name structure."""
     if not name_candidate:
         return False
     
-    # Allow up to 6 words for complex Albanian names
     if len(name_candidate.split()) > 6: 
         return False
     
@@ -108,7 +141,6 @@ def is_valid_name_format(name_candidate: str) -> bool:
         
     name_parts = HumanName(name_candidate)
     
-    # Require at least a first name and a last name, each being more than 1 char
     if name_parts.first and name_parts.last and len(name_parts.first) > 1 and len(name_parts.last) > 1:
         logger.debug(f"Name candidate '{name_candidate}' validated by nameparser: {name_parts.first} {name_parts.last}")
         return True
@@ -148,7 +180,6 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     finally:
         temp_pyresparser_file.unlink(missing_ok=True) 
 
-    # Extract full text content
     full_text_content = text_extractor.extract_text_from_resume(bytes_, filename)
     if not full_text_content:
         logger.warning(f"Full text content is empty for {filename}. Custom extraction will be limited.")
@@ -165,20 +196,20 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     # --- 3.3 ENHANCED NAME EXTRACTION LOGIC ---
     extracted_name = ""
     
-    # Generic Keywords
+    # Generic Keywords (Hardened against job titles/sections based on chat feedback)
     generic_keywords = [
-        "experienced", "developer", "professional", "resume", "cv", 
-        "curriculum vitae", "profile", "contact", "summary", "education", 
-        "experience", "skills", "projects", "full-stack", "front-end", 
-        "back-end", "manager", "engineer", "analyst", "github", "linkedin",
-        "mobile", "number", "email", "mail", "phone", "address", "objective",
-        "about me", "references", "work history", "career summary", 
-        "technical skills", "personal details", "city", "street", "vue js",
-        "git", "don bosko", "portfolio", "designer", 
-        "freelancer", "tech nexus", "axians", "kutia", "ubt", "product",
-        "bachelor", "master", "doctor", "phd", "pristina", "kosovo",
-        "personal info", "personal details", "contact info",
+        "experienced", "developer", "professional", "resume", "cv", "curriculum vitae", "profile", 
+        "contact", "summary", "education", "experience", "skills", "projects", "full-stack", 
+        "front-end", "back-end", "manager", "engineer", "analyst", "github", "linkedin",
+        "mobile", "number", "email", "mail", "phone", "address", "objective", "about me", 
+        "references", "work history", "career summary", "technical skills", "personal details", 
+        "city", "street", "vue js", "git", "don bosko", "portfolio", "designer", 
+        "freelancer", "tech nexus", "axians", "kutia", "ubt", "product", "bachelor", 
+        "master", "doctor", "phd", "pristina", "kosovo", "personal info", "contact info",
         "more information",
+        # CRITICAL FIXES for Altina/Era
+        "internship", "internships", "professional experience", "e-commerce", 
+        "developer position", "project manager", "assistant project manager"
     ] 
     generic_keywords_lower = set(kw.lower() for kw in generic_keywords)
     
@@ -186,107 +217,102 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     lines_top_of_resume = all_lines[:10] 
     
     def is_generic_or_bad(text: str) -> bool:
-        """Checks if a candidate line is a job title, common header, or otherwise invalid."""
         text_lower = text.lower()
         if any(kw in text_lower for kw in generic_keywords_lower):
             return True
-        # Reject if it contains numbers/symbols other than spaces/hyphens
+        if len(text.split()) == 1 and text_lower in generic_keywords_lower:
+            return True
         if re.search(r'[^\w\s-]', text) and not re.search(r'^\w+@\w+', text):
             return True
         return False
         
     def validate_candidate(candidate: str, source: str) -> Optional[str]:
-        """Validates a candidate against heuristics and nameparser."""
         candidate = candidate.replace('\n', ' ').strip()
-        
-        # 1. Heuristic Filter (length, bad keywords)
         words = candidate.split()
-        # Check: 2-6 words
-        if not (2 <= len(words) <= 6):
-            logger.debug(f"Candidate '{candidate}' from {source} failed word count (2-6).")
+        # Allow 1 word if it's a concatenated name for better resilience
+        if not (1 <= len(words) <= 6):
+            logger.debug(f"Candidate '{candidate}' from {source} failed word count (1-6).")
             return None
         if is_generic_or_bad(candidate):
             logger.debug(f"Candidate '{candidate}' from {source} failed generic keyword check.")
             return None
-            
-        # 2. Nameparser Validation
         if not is_valid_name_format(candidate):
             logger.debug(f"Candidate '{candidate}' from {source} failed nameparser validation.")
             return None
-            
         logger.debug(f"VALIDATED name candidate from {source}: '{candidate}'")
         return candidate
         
-    def aggressively_despace_name(text: str) -> Optional[str]:
-        """
-        Handles names with excessive single-space spacing (A D R I A N).
-        """
-        words = text.split()
-        
-        # Check if the line matches the single-letter-spacing pattern 
-        if len(words) >= 4 and all(len(word) <= 2 and word.isupper() for word in words):
-            merged_name = "".join(words)
-            
-            # Try to insert a space at common split points (4 to 9 characters)
-            for split in range(4, min(10, len(merged_name) - 3)):
-                candidate_with_space = merged_name[:split] + " " + merged_name[split:]
-                
-                # Check if adding a space makes it a valid name 
-                if is_valid_name_format(candidate_with_space):
-                    logger.debug(f"Aggressively de-spaced, inserted space, and validated name: '{candidate_with_space}'")
-                    return candidate_with_space.title() # Return in Title case
-            
-            logger.debug(f"Aggressively de-spaced name '{merged_name}' could not be parsed even with split attempts.")
-                
-        return None
-
-
     # --- NAME EXTRACTION PRIORITY CHAIN ---
 
-    # 1. Highest Priority: Email Proximity Heuristic (For floating names)
+    # 1. Email Proximity Heuristic 
     if final_email:
         for i, line in enumerate(all_lines):
             if final_email in line:
                 if i > 0:
                     candidate = all_lines[i-1]
                     extracted_name = validate_candidate(candidate, "Email Proximity - Prev Line")
-                    if extracted_name:
-                        break
+                    if extracted_name: break
                 if not extracted_name and nlp is not None:
                     doc_line = nlp(line)
                     for ent in doc_line.ents:
                         if ent.label_ == "PERSON":
-                            candidate = ent.text
-                            extracted_name = validate_candidate(candidate, "Email Proximity - SpaCy on Email Line")
-                            if extracted_name:
-                                break
-                    if extracted_name:
-                        break
+                            extracted_name = validate_candidate(ent.text, "Email Proximity - SpaCy on Email Line")
+                            if extracted_name: break
+                    if extracted_name: break
         
-    # 1a. NEW: Labeled Name Heuristic (For "Full Name: John Doe" type formats)
+    # 1a. Labeled Name Heuristic 
     if not extracted_name:
-        # Regex looks for "name", "full name", "applicant", etc., followed by optional colon/spaces and then the name content
         name_label_regex = re.compile(r'(\b(?:full\s*name|name|applicant|candidate|personal\s*details)\s*[:]?\s*)(.+)', re.IGNORECASE)
-        
         for line in lines_top_of_resume:
             match = name_label_regex.search(line)
             if match:
                 candidate = match.group(2).strip()
-                # Check if the extracted part is just more contact info
                 if any(kw in candidate.lower() for kw in ["email", "phone", "contact", "@", "address", "linkedin"]):
                      continue
-
                 extracted_name = validate_candidate(candidate, "Labeled Name Heuristic")
+                if extracted_name: break
+
+    # 1b. Name from File Name Heuristic
+    if not extracted_name and filename:
+        name_from_file = extract_name_from_filename(filename)
+        if name_from_file:
+            extracted_name = name_from_file
+            logger.debug(f"Selected name from File Name Heuristic: '{extracted_name}'")
+            
+    # 1c. NEW: High-Confidence Name-Label Extraction (LLM Insight Clean-Up)
+    if not extracted_name:
+        for line in lines_top_of_resume:
+            temp_candidate = line
+            
+            # 1. Clean out extracted contact info
+            if final_email:
+                temp_candidate = temp_candidate.replace(final_email, ' ')
+            if final_phone:
+                temp_candidate = temp_candidate.replace(final_phone, ' ')
+
+            # 2. Clean out common labels (start or end of line)
+            temp_candidate = re.sub(r'(?i)^\s*(email|phone|contact|mobile|linkedin|github)\s*[:\s]*', '', temp_candidate).strip()
+            temp_candidate = re.sub(r'(?i)\s*[:\s]*(email|phone|contact|mobile|linkedin|github)\s*$', '', temp_candidate).strip()
+            
+            # 3. Validate remaining text
+            cleaned_candidate = re.sub(r'\s+', ' ', temp_candidate).strip()
+            
+            # Require at least two words and proper capitalization (or all caps) for high confidence
+            is_capitalized = all(word[0].isupper() or len(word) <= 2 for word in cleaned_candidate.split()) or cleaned_candidate.isupper()
+            
+            if len(cleaned_candidate.split()) >= 2 and is_capitalized:
+                extracted_name = validate_candidate(cleaned_candidate, "High-Confidence Name-Label Clean-Up")
                 if extracted_name:
-                    logger.debug(f"Selected name from Labeled Name Heuristic: '{extracted_name}'")
+                    logger.debug(f"Selected name from High-Confidence Name-Label Clean-Up: '{extracted_name}'")
                     break
 
-    # 2. 1st Fallback: Top Lines Heuristic (Captures names placed correctly)
+            
+    # 2. 1st Fallback: Top Lines Heuristic 
     if not extracted_name:
         for line in lines_top_of_resume:
             despaced_line = re.sub(r'\s+', ' ', line).strip()
             
-            # Aggressive De-Spacing Check (Handles A D R I A N S H A L A)
+            # Aggressive De-Spacing Check 
             aggressively_despaced_name = aggressively_despace_name(line)
             if aggressively_despaced_name:
                 extracted_name = aggressively_despaced_name
@@ -299,9 +325,9 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
                 if extracted_name:
                     break
                     
-            # SpaCy Check on Top Lines (if capitalization check failed)
+            # SpaCy Check on Top Lines (Fixed: uses doc_line)
             if not extracted_name and nlp is not None:
-                doc_line = nlp(line)
+                doc_line = nlp(line) 
                 for ent in doc_line.ents:
                     if ent.label_ == "PERSON":
                         extracted_name = validate_candidate(ent.text, "Top Lines Heuristic - SpaCy")
@@ -310,7 +336,7 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
                 if extracted_name:
                     break
             
-    # 3. 2nd Fallback: Pyresparser Name (Strictly Filtered)
+    # 3. 2nd Fallback: Pyresparser Name 
     if not extracted_name:
         pyresparser_name = parsed_data_pyresparser.get("name", "").strip()
         if pyresparser_name and pyresparser_name.lower() not in (final_email or "").lower():
@@ -325,8 +351,6 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     # 5. LOWEST PRIORITY FALLBACK: Name from Email Address 
     if not extracted_name and final_email:
         email_prefix = final_email.split('@')[0]
-
-        # Step 1: Handle Common Separators (e.g., alba.krasniqi or alba-krasniqi)
         cleaned_prefix_separated = re.sub(r'[\d_]', ' ', email_prefix)
         cleaned_prefix_separated = re.sub(r'[\.-]', ' ', cleaned_prefix_separated).strip()
         cleaned_prefix_separated = re.sub(r'\s+', ' ', cleaned_prefix_separated) 
@@ -335,14 +359,10 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
             extracted_name = cleaned_prefix_separated.title()
             logger.debug(f"Selected name from Email Prefix (Separated) Fallback: '{extracted_name}'")
 
-        # Step 2: Handle Concatenated Names (e.g., albakrasniqi)
         if not extracted_name and len(email_prefix.split()) == 1:
             merged_name = email_prefix
-            
-            # Test common first name lengths (4 to 8 characters)
             for split in range(4, min(9, len(merged_name) - 3)):
                 candidate_with_space = merged_name[:split] + " " + merged_name[split:]
-                
                 if is_valid_name_format(candidate_with_space):
                     extracted_name = candidate_with_space.title()
                     logger.debug(f"Selected name from Email Prefix (Concatenated Heuristic) Fallback: '{extracted_name}'")
@@ -353,13 +373,14 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     
     final_name = str(extracted_name).replace('\n', ' ').strip() if extracted_name else ""
     
-    # FINAL FIX: Remove any trailing numbers (e.g., Alba Krasniqi1999 -> Alba Krasniqi)
+    # FINAL FIX: Remove any trailing numbers
     if final_name:
         final_name = re.sub(r'\s*\d+$', '', final_name).strip()
     
     final_email_cv = str(final_email).replace('\n', ' ').strip() if final_email else ""
     final_phone_cleaned = str(final_phone).replace('\n', ' ').strip() if final_phone else ""
 
+    # Ensure all return values are strings, even if empty, to prevent sheet/DB errors
     return {
         "name"              : final_name,
         "email_cv"          : final_email_cv,
