@@ -391,3 +391,4 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         "total_experience"  : parsed_data_pyresparser.get("total_experience", 0.0),
         "full_text_content" : full_text_content or "",
     }
+#almost fixed up names parsing
