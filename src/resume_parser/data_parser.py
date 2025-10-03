@@ -5,6 +5,7 @@ from pyresparser import ResumeParser
 from pathlib import Path
 from typing import Optional, List, Dict, Any 
 from nameparser import HumanName 
+from src.resume_parser import text_extractor
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG) 
@@ -26,7 +27,7 @@ except Exception as e:
         nlp = None 
 
 # Assuming this module exists in your project structure
-from src.resume_parser import text_extractor 
+# from src.resume_parser import text_extractor 
 
 # --- 2. HELPER FUNCTIONS ---
 
@@ -90,7 +91,8 @@ def is_valid_name_format(name_candidate: str) -> bool:
     if not name_candidate:
         return False
     
-    if len(name_candidate.split()) > 5:
+    # We increased this to 6. Keep it.
+    if len(name_candidate.split()) > 6: 
         return False
     
     if re.search(r'[^\w\s-]', name_candidate) and not re.search(r'^\w+@\w+', name_candidate):
@@ -98,6 +100,7 @@ def is_valid_name_format(name_candidate: str) -> bool:
         
     name_parts = HumanName(name_candidate)
     
+    # Require at least a first name and a last name, each being more than 1 char
     if name_parts.first and name_parts.last and len(name_parts.first) > 1 and len(name_parts.last) > 1:
         logger.debug(f"Name candidate '{name_candidate}' validated by nameparser: {name_parts.first} {name_parts.last}")
         return True
@@ -137,7 +140,16 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     finally:
         temp_pyresparser_file.unlink(missing_ok=True) 
 
-    full_text_content = text_extractor.extract_text_from_resume(bytes_, filename)
+    # ASSUMPTION: Replace placeholder with actual extraction call
+    # full_text_content = text_extractor.extract_text_from_resume(bytes_, filename)
+    # Since 'text_extractor' is a placeholder, we use an empty string if it's not defined
+    try:
+        full_text_content = text_extractor.extract_text_from_resume(bytes_, filename)
+    except NameError:
+        full_text_content = ""
+        logger.warning("text_extractor module not found, using empty text content.")
+
+
     if not full_text_content:
         logger.warning(f"Full text content is empty for {filename}. Custom extraction will be limited.")
 
@@ -162,11 +174,11 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         "mobile", "number", "email", "mail", "phone", "address", "objective",
         "about me", "references", "work history", "career summary", 
         "technical skills", "personal details", "city", "street", "vue js",
-        "git", "don bosko", "altina avdyli", "portfolio", "designer", 
+        "git", "don bosko", "portfolio", "designer", 
         "freelancer", "tech nexus", "axians", "kutia", "ubt", "product",
         "bachelor", "master", "doctor", "phd", "pristina", "kosovo",
         "personal info", "personal details", "contact info",
-        "more information", # <<< FIX for 'MORE INFORMATION' case
+        "more information", "about me"
     ] 
     generic_keywords_lower = set(kw.lower() for kw in generic_keywords)
     
@@ -191,8 +203,9 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         
         # 1. Heuristic Filter (length, bad keywords)
         words = candidate.split()
-        if not (2 <= len(words) <= 5):
-            logger.debug(f"Candidate '{candidate}' from {source} failed word count (2-5).")
+        # Increased check: 2-6 words
+        if not (2 <= len(words) <= 6):
+            logger.debug(f"Candidate '{candidate}' from {source} failed word count (2-6).")
             return None
         if is_generic_or_bad(candidate):
             logger.debug(f"Candidate '{candidate}' from {source} failed generic keyword check.")
@@ -209,19 +222,26 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     def aggressively_despace_name(text: str) -> Optional[str]:
         """
         Handles names with excessive single-space spacing (A D R I A N).
-        Looks for lines where most words are 1-2 characters and capitalized.
+        CRITICAL FIX: Attempts to insert a space before validating with nameparser.
         """
         words = text.split()
         
-        # Check if the line matches the single-letter-spacing pattern (e.g., all 1-2 char, capitalized)
+        # Check if the line matches the single-letter-spacing pattern 
         if len(words) >= 4 and all(len(word) <= 2 and word.isupper() for word in words):
-            # Aggressively merge all single-character words separated by a space
+            # 1. Aggressively merge the name
             merged_name = "".join(words)
             
-            # Now, try to use nameparser on the merged name
-            if is_valid_name_format(merged_name):
-                logger.debug(f"Aggressively de-spaced and validated name: '{merged_name}'")
-                return merged_name
+            # 2. Try to insert a space at common split points (4 to 9 characters)
+            for split in range(4, min(10, len(merged_name) - 3)):
+                candidate_with_space = merged_name[:split] + " " + merged_name[split:]
+                
+                # Check if adding a space makes it a valid name 
+                if is_valid_name_format(candidate_with_space):
+                    # We found a plausible split that nameparser likes
+                    logger.debug(f"Aggressively de-spaced, inserted space, and validated name: '{candidate_with_space}'")
+                    return candidate_with_space.title() # Return in Title case
+            
+            logger.debug(f"Aggressively de-spaced name '{merged_name}' could not be parsed even with split attempts.")
                 
         return None
 
@@ -254,7 +274,7 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         for line in lines_top_of_resume:
             despaced_line = re.sub(r'\s+', ' ', line).strip()
             
-            # **NEW FIX** - Aggressive De-Spacing Check for 'A D R I A N S H A L A'
+            # **CRITICAL FIX** - Aggressive De-Spacing Check for 'A D R I A N S H A L A'
             aggressively_despaced_name = aggressively_despace_name(line)
             if aggressively_despaced_name:
                 extracted_name = aggressively_despaced_name
@@ -289,6 +309,36 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         spacy_extracted_name_full = extract_name_with_spacy(full_text_content)
         if spacy_extracted_name_full:
             extracted_name = validate_candidate(spacy_extracted_name_full, "SpaCy Full Text (Last Resort)")
+            
+    # 5. NEW LOWEST PRIORITY FALLBACK: Name from Email Address (e.g., john.doe@mail.com -> John Doe)
+    if not extracted_name and final_email:
+        
+        # Get the part before the @
+        email_prefix = final_email.split('@')[0]
+
+        # --- Step 1: Handle Common Separators (e.g., alba.krasniqi or alba-krasniqi) ---
+        cleaned_prefix_separated = re.sub(r'[\d_]', ' ', email_prefix)
+        cleaned_prefix_separated = re.sub(r'[\.-]', ' ', cleaned_prefix_separated).strip()
+        cleaned_prefix_separated = re.sub(r'\s+', ' ', cleaned_prefix_separated) 
+        
+        if is_valid_name_format(cleaned_prefix_separated):
+            extracted_name = cleaned_prefix_separated.title()
+            logger.debug(f"Selected name from Email Prefix (Separated) Fallback: '{extracted_name}'")
+
+        # --- Step 2: Handle Concatenated Names (e.g., albakrasniqi) ---
+        # Only try this if Step 1 didn't find anything AND the original prefix was a single word.
+        if not extracted_name and len(email_prefix.split()) == 1:
+            merged_name = email_prefix
+            
+            # Test common first name lengths (4 to 8 characters)
+            for split in range(4, min(9, len(merged_name) - 3)):
+                candidate_with_space = merged_name[:split] + " " + merged_name[split:]
+                
+                # Check if nameparser can now validate it (albakrasniqi -> alba krasniqi)
+                if is_valid_name_format(candidate_with_space):
+                    extracted_name = candidate_with_space.title()
+                    logger.debug(f"Selected name from Email Prefix (Concatenated Heuristic) Fallback: '{extracted_name}'")
+                    break 
 
 
     # --- 3.4 FINAL CLEANUP AND RETURN ---
