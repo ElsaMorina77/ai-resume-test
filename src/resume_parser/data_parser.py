@@ -4,10 +4,9 @@ import spacy
 from pyresparser import ResumeParser
 from pathlib import Path
 from typing import Optional, List, Dict, Any 
-from nameparser import HumanName # Required for advanced name validation
+from nameparser import HumanName 
 
 logger = logging.getLogger(__name__)
-# Set to DEBUG to see all the steps the parser is taking
 logger.setLevel(logging.DEBUG) 
 
 # --- 1. SETUP: SPACY MODEL LOADING ---
@@ -15,13 +14,11 @@ print(f"DEBUG: Attempting to load spaCy model 'en_core_web_lg' from {__file__}")
 
 nlp = None
 try:
-    # Try loading the larger model for better NER accuracy
     nlp = spacy.load('en_core_web_lg') 
     logger.info("spaCy model 'en_core_web_lg' loaded successfully.")
 except Exception as e:
     logger.warning(f"Could not load spaCy model 'en_core_web_lg': {e}. Falling back to 'en_core_web_sm'.")
     try:
-        # Fallback to the smaller model
         nlp = spacy.load('en_core_web_sm') 
         logger.info("spaCy model 'en_core_web_sm' loaded successfully.")
     except Exception as e_sm:
@@ -34,10 +31,6 @@ from src.resume_parser import text_extractor
 # --- 2. HELPER FUNCTIONS ---
 
 def extract_phone_number(text: str) -> Optional[str]: 
-    """
-    Extracts a phone number from the given text using a comprehensive regex pattern.
-    Returns the most plausible phone number found or None.
-    """
     phone_regex = re.compile(
         r'''
         (?:(?:\+|00)\d{1,3}[-.\s]?)? 
@@ -69,10 +62,6 @@ def extract_phone_number(text: str) -> Optional[str]:
 
 
 def extract_email_address(text: str) -> Optional[str]:
-    """
-    Extracts an email address from the given text using a standard regex pattern.
-    Returns the first match found or None.
-    """
     email_regex = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
     match = email_regex.search(text)
     if match:
@@ -82,18 +71,12 @@ def extract_email_address(text: str) -> Optional[str]:
     return None
 
 def extract_name_with_spacy(text: str) -> Optional[str]:
-    """
-    EXTRACT NAME WITH SPACY (FIXED NAMEERROR)
-    Extracts a person's name from the text using spaCy's Named Entity Recognition (NER).
-    Returns the first PERSON entity found or None.
-    """
-    global nlp # Ensure we are using the globally loaded nlp object
+    global nlp 
 
     if nlp is None:
         logger.warning("spaCy model not loaded, cannot extract name with spaCy.")
         return None
 
-    # Process only the first few KB of text for faster and more relevant NER
     doc = nlp(text[:2048]) 
     for ent in doc.ents:
         if ent.label_ == "PERSON":
@@ -103,23 +86,18 @@ def extract_name_with_spacy(text: str) -> Optional[str]:
     return None
 
 def is_valid_name_format(name_candidate: str) -> bool:
-    """
-    Uses nameparser to check if a string has a recognizable first and last name structure.
-    """
+    """Uses nameparser to check if a string has a recognizable first and last name structure."""
     if not name_candidate:
         return False
     
-    # Simple check for very long strings that are likely full titles/sentences
     if len(name_candidate.split()) > 5:
         return False
     
-    # Check for excessive non-alpha characters (like in phone numbers or addresses)
     if re.search(r'[^\w\s-]', name_candidate) and not re.search(r'^\w+@\w+', name_candidate):
         return False
         
     name_parts = HumanName(name_candidate)
     
-    # Require at least a first name and a last name, each being more than 1 char
     if name_parts.first and name_parts.last and len(name_parts.first) > 1 and len(name_parts.last) > 1:
         logger.debug(f"Name candidate '{name_candidate}' validated by nameparser: {name_parts.first} {name_parts.last}")
         return True
@@ -131,11 +109,6 @@ def is_valid_name_format(name_candidate: str) -> bool:
 # --- 3. MAIN PARSING FUNCTION ---
 
 def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
-    """
-    Uses pyresparser to parse various resume fields, and enhances with custom
-    name, phone, and email extraction, with a focus on contact proximity.
-    """
-
     # --- 3.1 PYRESPARSER EXECUTION ---
     temp_pyresparser_file = Path("_tmp_pyresparser_" + Path(filename).name)
     temp_pyresparser_file.write_bytes(bytes_)
@@ -180,7 +153,7 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
     # --- 3.3 ENHANCED NAME EXTRACTION LOGIC ---
     extracted_name = ""
     
-    # EXPANDED Generic Keywords (CRITICALLY including 'Personal Info' and contact/location headers)
+    # EXPANDED Generic Keywords (FIXED: 'Personal Info' and 'MORE INFORMATION' added)
     generic_keywords = [
         "experienced", "developer", "professional", "resume", "cv", 
         "curriculum vitae", "profile", "contact", "summary", "education", 
@@ -192,8 +165,8 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         "git", "don bosko", "altina avdyli", "portfolio", "designer", 
         "freelancer", "tech nexus", "axians", "kutia", "ubt", "product",
         "bachelor", "master", "doctor", "phd", "pristina", "kosovo",
-        # CRITICAL ADDITIONS TO REJECT HEADERS:
-        "personal info", "personal details", "contact info"
+        "personal info", "personal details", "contact info",
+        "more information", # <<< FIX for 'MORE INFORMATION' case
     ] 
     generic_keywords_lower = set(kw.lower() for kw in generic_keywords)
     
@@ -232,6 +205,25 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
             
         logger.debug(f"VALIDATED name candidate from {source}: '{candidate}'")
         return candidate
+        
+    def aggressively_despace_name(text: str) -> Optional[str]:
+        """
+        Handles names with excessive single-space spacing (A D R I A N).
+        Looks for lines where most words are 1-2 characters and capitalized.
+        """
+        words = text.split()
+        
+        # Check if the line matches the single-letter-spacing pattern (e.g., all 1-2 char, capitalized)
+        if len(words) >= 4 and all(len(word) <= 2 and word.isupper() for word in words):
+            # Aggressively merge all single-character words separated by a space
+            merged_name = "".join(words)
+            
+            # Now, try to use nameparser on the merged name
+            if is_valid_name_format(merged_name):
+                logger.debug(f"Aggressively de-spaced and validated name: '{merged_name}'")
+                return merged_name
+                
+        return None
 
 
     # 1. Highest Priority: Email Proximity Heuristic (For floating names)
@@ -262,7 +254,14 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         for line in lines_top_of_resume:
             despaced_line = re.sub(r'\s+', ' ', line).strip()
             
-            # Simple Capitalization Check (For A D R I A N style names)
+            # **NEW FIX** - Aggressive De-Spacing Check for 'A D R I A N S H A L A'
+            aggressively_despaced_name = aggressively_despace_name(line)
+            if aggressively_despaced_name:
+                extracted_name = aggressively_despaced_name
+                logger.debug(f"Selected name from Aggressive De-Spacing: '{extracted_name}'")
+                break
+            
+            # Original Simple Capitalization Check 
             if all(word[0].isupper() or len(word) <= 2 for word in despaced_line.split()) or despaced_line.isupper():
                 extracted_name = validate_candidate(despaced_line, "Top Lines Heuristic - De-Spaced")
                 if extracted_name:
