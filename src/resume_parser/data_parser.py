@@ -410,7 +410,7 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
         if spacy_extracted_name_full:
             extracted_name = validate_candidate(spacy_extracted_name_full, "SpaCy Full Text (Last Resort)")
             
-    # 6. LOWEST PRIORITY FALLBACK: Name from Email Address
+    # 6. LOWEST PRIORITY FALLBACK: Name from Email Addresss
     if not extracted_name and final_email:
         email_prefix = final_email.split('@')[0]
         cleaned_prefix_separated = re.sub(r'[\d_]', ' ', email_prefix)

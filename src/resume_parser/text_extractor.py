@@ -36,7 +36,7 @@ def extract_text_from_resume(bytes_: bytes, filename: str) -> str:
     finally:
         temp_file.unlink(missing_ok=True)
 
-    # Aggressively normalize whitespace before returning
+    # Aggressively normalize whitespace before returningg
     if full_text_content:
         # Replace multiple newlines with a standard double newline (paragraph break)
         full_text_content = re.sub(r'\n\s*\n', '\n\n', full_text_content)
