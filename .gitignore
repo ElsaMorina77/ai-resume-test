@@ -1,6 +1,7 @@
 # Ignore virtual environments
 .venv/
 .venv_py38/
+.venv_py311/
 
 # Byte-compiled / cache files
 __pycache__/
@@ -23,3 +24,14 @@ config/credentials.json
 config/client_secret.json
 token.json
 credentials.json
+
+
+
+# Python virtual environments
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
