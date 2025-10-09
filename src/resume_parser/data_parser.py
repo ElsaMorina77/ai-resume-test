@@ -11,16 +11,13 @@ from nameparser import HumanName
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG) 
 
-# --- 2. HUGGING FACE IMPORTS AND SETUP (UPDATED MODEL) ---
+# --- 2. HUGGING FACE IMPORTS AND SETUP ---
 try:
     from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
     import torch
     
-    # *** UPDATED MODEL ID ***
-    # This model is specifically fine-tuned for Resume/CV Named Entity Recognition.
     HF_MODEL_ID = "yashpwr/resume-ner-bert-v2" 
     
-    # Global variables for the HF pipeline
     hf_pipeline = None
     HF_MODEL_LOADED = False
     
@@ -28,21 +25,16 @@ try:
         """Loads the Hugging Face model and sets up the pipeline."""
         global hf_pipeline, HF_MODEL_LOADED
         try:
-            # We use try/except block here because AutoModelForTokenClassification 
-            # might not work with some transformers models like LayoutLM, 
-            # but this BERT-based model should be compatible.
             tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID)
             model = AutoModelForTokenClassification.from_pretrained(HF_MODEL_ID)
-            # The aggregation strategy is crucial for joining split names (e.g., "John", "Doe")
             hf_pipeline = pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
             HF_MODEL_LOADED = True
             logger.info(f"Successfully loaded Hugging Face NER model: {HF_MODEL_ID}")
         except Exception as e:
-            logger.warning(f"Failed to load Hugging Face model {HF_MODEL_ID}. Reverting to standard fallbacks. Error: {e}")
+            logger.warning(f"Failed to load Hugging Face model {HF_MODEL_ID}. Error: {e}")
             HF_MODEL_LOADED = False
             hf_pipeline = None
 
-    # Load the model on startup
     load_hf_pipeline()
 except ImportError:
     logger.warning("Hugging Face (transformers/torch) not installed. Skipping HF fallback.")
@@ -52,7 +44,6 @@ except Exception as e:
     HF_MODEL_LOADED = False
 
 # --- 3. SPACY SETUP ---
-
 nlp = None
 try:
     nlp = spacy.load('en_core_web_lg') 
@@ -68,7 +59,6 @@ class MockTextExtractor:
     def extract_text_from_resume(bytes_, filename):
         return ""
 try:
-    # Assuming text_extractor utility is available in src.resume_parser
     from src.resume_parser import text_extractor 
 except ImportError:
     text_extractor = MockTextExtractor()
@@ -119,339 +109,316 @@ def extract_name_with_spacy(text: str) -> Optional[str]:
             return ent.text
     return None
 
-# --- NEW: HUGGING FACE EXTRACTION FUNCTION (UPDATED) ---
 def extract_name_with_hf_ner(lines: List[str]) -> Optional[str]:
     """Uses the Hugging Face NER pipeline to extract a person's name."""
     global hf_pipeline
     if not HF_MODEL_LOADED or hf_pipeline is None:
         return None
 
-    # *** INCREASED TEXT WINDOW ***
-    # Analyze the top 15 lines to catch names that are further down.
-    text_to_analyze = "\n".join(lines[:15]) 
+    text_to_analyze = "\n".join(lines[:20])  # Increased window
     
     try:
-        # Run NER inference
         ner_results = hf_pipeline(text_to_analyze)
         
-        # Filter for entities labeled as 'Name' or 'PER' (Person)
-        person_entities = [
-            entity['word'].strip() 
-            for entity in ner_results 
-            if entity['entity_group'].upper() == 'NAME' or entity['entity_group'].upper() == 'PER'
-        ]
+        # Filter for person entities
+        person_entities = []
+        for entity in ner_results:
+            entity_label = entity['entity_group'].upper()
+            if entity_label in ['NAME', 'PER', 'PERSON']:
+                # Clean up tokenization artifacts
+                clean_word = entity['word'].replace('##', '').replace('Ġ', '').strip()
+                if clean_word:
+                    person_entities.append(clean_word)
         
         if person_entities:
-            # Join the entities (if the model split a name) and choose the longest
+            # Try to combine adjacent entities
             candidates = set()
-            for i in range(len(person_entities)):
-                # Join with the next entity to catch First Name Last Name
-                if i < len(person_entities) - 1:
-                    two_word = f"{person_entities[i]} {person_entities[i+1]}".replace(' ##', '').replace('#', '').strip()
-                    if len(two_word.split()) >= 2:
-                         candidates.add(two_word)
-                candidates.add(person_entities[i].replace(' ##', '').replace('#', '').strip())
-
-            # Find the best candidate based on validation
-            best_name = None
-            for candidate in sorted(candidates, key=len, reverse=True):
-                if is_valid_name_format(candidate):
-                    best_name = candidate
-                    logger.debug(f"HF NER successfully extracted: {best_name}")
-                    return best_name
             
-            logger.debug(f"HF NER found entities but none passed name validation: {candidates}")
-            return None
+            # Single entities
+            for entity in person_entities:
+                candidates.add(entity)
+            
+            # Two consecutive entities (First + Last name)
+            for i in range(len(person_entities) - 1):
+                combined = f"{person_entities[i]} {person_entities[i+1]}"
+                candidates.add(combined)
+            
+            # Three consecutive entities (First + Middle + Last)
+            for i in range(len(person_entities) - 2):
+                combined = f"{person_entities[i]} {person_entities[i+1]} {person_entities[i+2]}"
+                candidates.add(combined)
+
+            # Find best candidate
+            valid_candidates = []
+            for candidate in candidates:
+                cleaned = clean_name_string(candidate)
+                if is_valid_name_format(cleaned):
+                    valid_candidates.append(cleaned)
+            
+            if valid_candidates:
+                # Prefer longer names (more complete)
+                best = max(valid_candidates, key=lambda x: len(x.split()))
+                logger.debug(f"HF NER extracted: {best}")
+                return best
 
     except Exception as e:
         logger.error(f"Error during Hugging Face NER inference: {e}")
-        return None
     
     return None
 
 
-def aggressively_despace_name(text: str) -> Optional[str]:
-    words = text.split()
-    if len(words) >= 4 and all(len(word) <= 2 and word.isupper() for word in words):
-        merged_name = "".join(words)
-        for split in range(4, min(10, len(merged_name) - 3)):
-            candidate_with_space = merged_name[:split] + " " + merged_name[split:]
-            if is_valid_name_format(candidate_with_space):
-                return candidate_with_space.title()
+def clean_name_string(name: str) -> str:
+    """Clean up a name string by removing common artifacts."""
+    if not name:
+        return ""
     
-    if len(words) == 1 and len(text) > 7:
-        merged_name = text.lower()
-        for split in range(4, min(9, len(merged_name) - 3)):
-            candidate_with_space = merged_name[:split].title() + " " + merged_name[split:].title()
-            if is_valid_name_format(candidate_with_space):
-                return candidate_with_space
-            
-    return None
-
-def extract_name_from_filename(filename: str) -> Optional[str]:
-    name_part = Path(filename).stem
-    name_part = re.sub(r'(?i)CV|RESUME|PORTFOLIO|DOKUMENT|(?:\s*\(\d+\))|\d{4,}', ' ', name_part).strip()
-    cleaned_name = re.sub(r'[\s\._-]+', ' ', name_part).strip()
+    # Remove multiple spaces
+    name = re.sub(r'\s+', ' ', name)
     
-    if is_valid_name_format(cleaned_name):
-        return cleaned_name.title()
+    # Remove leading/trailing punctuation
+    name = re.sub(r'^[^\w\s]+|[^\w\s]+$', '', name)
     
-    if len(cleaned_name.split()) == 1:
-        concatenated_split = aggressively_despace_name(cleaned_name)
-        if concatenated_split:
-            return concatenated_split
-        
-    return None
+    # Remove digits
+    name = re.sub(r'\d+', '', name)
+    
+    # Title case
+    name = name.strip().title()
+    
+    return name
 
 
 def is_valid_name_format(name_candidate: str) -> bool:
+    """Enhanced name validation with better logic."""
     if not name_candidate:
         return False
     
-    if len(name_candidate.split()) > 6: 
+    # Clean the candidate first
+    cleaned = clean_name_string(name_candidate)
+    words = cleaned.split()
+    
+    # Must have 2-4 words (First Last, or First Middle Last, etc.)
+    if not (2 <= len(words) <= 4):
         return False
     
-    if re.search(r'[^\w\s-]', name_candidate) and not re.search(r'^\w+@\w+', name_candidate):
+    # Each word should be at least 2 characters
+    if any(len(word) < 2 for word in words):
         return False
-        
-    name_parts = HumanName(name_candidate)
     
-    if name_parts.first and name_parts.last and len(name_parts.first) > 1 and len(name_parts.last) > 1:
-        return True
+    # Check for invalid characters (but allow hyphens and apostrophes in names)
+    if re.search(r'[^a-zA-Z\s\'-]', cleaned):
+        return False
+    
+    # Use HumanName parser for validation
+    parsed_name = HumanName(cleaned)
+    
+    # Must have at least first and last name
+    if parsed_name.first and parsed_name.last:
+        # Both must be at least 2 characters
+        if len(parsed_name.first) >= 2 and len(parsed_name.last) >= 2:
+            return True
     
     return False
+
+
+def extract_name_from_filename(filename: str) -> Optional[str]:
+    """Extract name from filename."""
+    name_part = Path(filename).stem
+    
+    # Remove common resume keywords
+    keywords_to_remove = [
+        r'(?i)CV', r'(?i)RESUME', r'(?i)PORTFOLIO', r'(?i)DOCUMENT',
+        r'\(\d+\)', r'\d{4,}', r'(?i)_final', r'(?i)_updated'
+    ]
+    
+    for pattern in keywords_to_remove:
+        name_part = re.sub(pattern, ' ', name_part)
+    
+    # Replace separators with spaces
+    name_part = re.sub(r'[\s\._-]+', ' ', name_part).strip()
+    
+    cleaned = clean_name_string(name_part)
+    
+    if is_valid_name_format(cleaned):
+        return cleaned
+        
+    return None
+
+
+def is_generic_text(text: str) -> bool:
+    """Check if text contains generic resume keywords."""
+    generic_keywords = {
+        "experienced", "developer", "professional", "resume", "cv", "curriculum vitae",
+        "profile", "contact", "summary", "education", "experience", "skills", "projects",
+        "full-stack", "front-end", "back-end", "manager", "engineer", "analyst",
+        "github", "linkedin", "mobile", "number", "email", "phone", "address",
+        "objective", "about me", "references", "work history", "career summary",
+        "technical skills", "personal details", "portfolio", "cover letter"
+    }
+    
+    text_lower = text.lower()
+    return any(keyword in text_lower for keyword in generic_keywords)
+
+
+def extract_name_near_email(lines: List[str], email: str) -> Optional[str]:
+    """Extract name from lines near the email address."""
+    for i, line in enumerate(lines):
+        if email in line:
+            # Check previous line
+            if i > 0:
+                candidate = lines[i - 1]
+                cleaned = clean_name_string(candidate)
+                if not is_generic_text(cleaned) and is_valid_name_format(cleaned):
+                    logger.debug(f"Found name above email: {cleaned}")
+                    return cleaned
+            
+            # Check same line (before email)
+            before_email = line.split(email)[0].strip()
+            cleaned = clean_name_string(before_email)
+            if not is_generic_text(cleaned) and is_valid_name_format(cleaned):
+                logger.debug(f"Found name on email line: {cleaned}")
+                return cleaned
+    
+    return None
+
+
+def extract_name_from_labeled_field(lines: List[str]) -> Optional[str]:
+    """Extract name from fields labeled as 'Name:', 'Full Name:', etc."""
+    name_patterns = [
+        r'(?i)^(?:full\s+)?name\s*[:\-]?\s*(.+)$',
+        r'(?i)^(?:applicant|candidate)\s*[:\-]?\s*(.+)$',
+    ]
+    
+    for line in lines:
+        for pattern in name_patterns:
+            match = re.search(pattern, line)
+            if match:
+                candidate = match.group(1).strip()
+                # Remove common suffixes like email/phone from the same line
+                candidate = re.sub(r'[\|\-].*$', '', candidate).strip()
+                cleaned = clean_name_string(candidate)
+                if not is_generic_text(cleaned) and is_valid_name_format(cleaned):
+                    logger.debug(f"Found labeled name: {cleaned}")
+                    return cleaned
+    
+    return None
+
 
 # --- 5. MAIN PARSING FUNCTION ---
 
 def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
-    # --- 5.1 PYRESPARSER EXECUTION ---
-    temp_pyresparser_file = Path("_tmp_pyresparser_" + Path(filename).name)
-    temp_pyresparser_file.write_bytes(bytes_)
-    parsed_data_pyresparser = {}
+    """Main function to parse resume data."""
+    
+    # --- PyResParser Execution ---
+    temp_file = Path("_tmp_pyresparser_" + Path(filename).name)
+    temp_file.write_bytes(bytes_)
+    parsed_data = {}
     
     try:
-        # Pyresparser setup (kept logic for nlp/no-nlp fallbacks)
         if nlp is not None:
             try:
-                parser = ResumeParser(str(temp_pyresparser_file), custom_nlp=nlp)
-                parsed_data_pyresparser = parser.get_extracted_data() or {}
+                parser = ResumeParser(str(temp_file), custom_nlp=nlp)
+                parsed_data = parser.get_extracted_data() or {}
             except Exception:
-                try:
-                    parser = ResumeParser(str(temp_pyresparser_file))
-                    parsed_data_pyresparser = parser.get_extracted_data() or {}
-                except:
-                    parsed_data_pyresparser = {}
+                parser = ResumeParser(str(temp_file))
+                parsed_data = parser.get_extracted_data() or {}
         else:
-            try:
-                parser = ResumeParser(str(temp_pyresparser_file))
-                parsed_data_pyresparser = parser.get_extracted_data() or {}
-            except Exception:
-                parsed_data_pyresparser = {}
+            parser = ResumeParser(str(temp_file))
+            parsed_data = parser.get_extracted_data() or {}
     except Exception as e:
-        logger.error(f"General error parsing resume with pyresparser for '{filename}': {e}")
-        parsed_data_pyresparser = {}
+        logger.error(f"Error parsing resume with pyresparser: {e}")
     finally:
-        temp_pyresparser_file.unlink(missing_ok=True) 
+        temp_file.unlink(missing_ok=True)
 
-    full_text_content = text_extractor.extract_text_from_resume(bytes_, filename)
-    pre_processed_text = full_text_content 
-
-    # --- 5.2 CONTACT EXTRACTION AND PRE-PROCESSING ---
-    pyresparser_phone = parsed_data_pyresparser.get("mobile_number", "")
-    custom_extracted_phone = extract_phone_number(full_text_content) if full_text_content else None
-    final_phone = custom_extracted_phone if custom_extracted_phone else pyresparser_phone 
-
-    pyresparser_email = parsed_data_pyresparser.get("email", "")
-    custom_extracted_email = extract_email_address(full_text_content) if full_text_content else None
-    final_email = custom_extracted_email if custom_extracted_email else pyresparser_email
-
-    # Concatenation Fix 
-    if final_email and pre_processed_text:
-        concat_pattern = re.compile(r'(\S)' + re.escape(final_email))
-        match = concat_pattern.search(pre_processed_text)
-        if match and not match.group(1).isspace() and match.group(1) not in (':', ';', '('):
-            pre_processed_text = pre_processed_text.replace(final_email, ' ' + final_email, 1)
-
-    all_lines = [line.strip() for line in (pre_processed_text or "").split('\n') if line.strip()]
-    lines_top_of_resume = all_lines[:15] # Increased to match HF search window
-
-    # --- 5.3 ENHANCED NAME EXTRACTION LOGIC ---
-    extracted_name = ""
+    # Extract full text
+    full_text = text_extractor.extract_text_from_resume(bytes_, filename)
     
-    # Generic Keywords (EXPANDED based on failure cases)
-    generic_keywords = [
-        "experienced", "developer", "professional", "resume", "cv", "curriculum vitae", "profile", 
-        "contact", "summary", "education", "experience", "skills", "projects", "full-stack", 
-        "front-end", "back-end", "manager", "engineer", "analyst", "github", "linkedin",
-        "mobile", "number", "email", "mail", "phone", "address", "objective", "about me", 
-        "references", "work history", "career summary", "technical skills", "personal details", 
-        "city", "street", "vue js", "git", "don bosko", "portfolio", "designer", 
-        "freelancer", "tech nexus", "axians", "kutia", "ubt", "product", "bachelor", 
-        "master", "doctor", "phd", "pristina", "kosovo", "personal info", "contact info",
-        "more information", "internship", "internships", "professional experience", "e-commerce", 
-        "developer position", "project manager", "assistant project manager",
-        "booklet", "certified", "expert", "digital transformation", "toolkit", 
-        "assessors nominations form", "nomination form for final", "leter motivuese",
-        "troubleshooting enthusiast", "javafx interaction desktop app", "cover letter",
-        "zhvillues softueri", "introduction", "copy of ahmetaj", "training flyer",
-        "reference by jone cd", "cv by", "cv for", "motivation letter", # Existing
-        # ADDED BASED ON FAILURE LOGS:
-        "booklet certified digital transformation expert", "docu ment", "about myself", "tailwind", "creating",
-    ] 
-    generic_keywords_lower = set(kw.lower() for kw in generic_keywords)
+    # Extract contact info
+    email = extract_email_address(full_text) or parsed_data.get("email", "")
+    phone = extract_phone_number(full_text) or parsed_data.get("mobile_number", "")
     
-    def is_generic_or_bad(text: str) -> bool:
-        text_lower = text.lower()
-        if any(kw in text_lower for kw in generic_keywords_lower): return True
-        if len(text.split()) == 1 and text_lower in generic_keywords_lower: return True
-        if re.search(r'[^\w\s-]', text) and not re.search(r'^\w+@\w+', text): return True
-        return False
-        
-    def validate_candidate(candidate: str, source: str) -> Optional[str]:
-        candidate = candidate.replace('\n', ' ').strip()
-        words = candidate.split()
-        if not (1 <= len(words) <= 6): return None
-        if is_generic_or_bad(candidate): return None
-        
-        if len(words) == 1:
-             concatenated_split = aggressively_despace_name(candidate)
-             if concatenated_split:
-                 candidate = concatenated_split
-                 words = candidate.split()
-                 if not (2 <= len(words) <= 6): return None
-        
-        if not is_valid_name_format(candidate): return None
-        logger.debug(f"VALIDATED name candidate from {source}: '{candidate}'")
-        return candidate
-        
+    # Get lines for processing
+    lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+    top_lines = lines[:25]  # Extended window
+    
     # --- NAME EXTRACTION PRIORITY CHAIN ---
-
-    # 1. Email Proximity Heuristic 
-    if final_email:
-        for i, line in enumerate(all_lines):
-            if final_email in line:
-                if i > 0:
-                    extracted_name = validate_candidate(all_lines[i-1], "Email Proximity - Prev Line")
-                    if extracted_name: break
-                if not extracted_name and nlp is not None:
-                    doc_line = nlp(line)
-                    for ent in doc_line.ents:
-                        if ent.label_ == "PERSON":
-                            extracted_name = validate_candidate(ent.text, "Email Proximity - SpaCy on Email Line")
-                            if extracted_name: break
-                    if extracted_name: break
-        
-    # 1a. Labeled Name Heuristic
+    extracted_name = None
+    
+    # 1. Try labeled field extraction (highest confidence)
     if not extracted_name:
-        name_label_regex = re.compile(r'(\b(?:full\s*name|name|applicant|candidate|personal\s*details)\s*[:]?\s*)(.+)', re.IGNORECASE)
-        for line in lines_top_of_resume:
-            match = name_label_regex.search(line)
-            if match:
-                candidate = match.group(2).strip()
-                if any(kw in candidate.lower() for kw in ["email", "phone", "contact", "@", "address", "linkedin"]): continue
-                extracted_name = validate_candidate(candidate, "Labeled Name Heuristic")
-                if extracted_name: break
-
-    # 1b. Name from File Name Heuristic
-    if not extracted_name and filename:
-        name_from_file = extract_name_from_filename(filename)
-        if name_from_file:
-            extracted_name = name_from_file
-            
-    # 1c. High-Confidence Name-Label Extraction
-    if not extracted_name:
-        for line in lines_top_of_resume:
-            temp_candidate = line
-            if final_email: temp_candidate = temp_candidate.replace(final_email, ' ')
-            if final_phone: temp_candidate = temp_candidate.replace(final_phone, ' ')
-            temp_candidate = re.sub(r'(?i)^\s*(email|phone|contact|mobile|linkedin|github)\s*[:\s]*', '', temp_candidate).strip()
-            temp_candidate = re.sub(r'(?i)\s*[:\s]*(email|phone|contact|mobile|linkedin|github)\s*$', '', temp_candidate).strip()
-            cleaned_candidate = re.sub(r'\s+', ' ', temp_candidate).strip()
-            is_capitalized = all(word[0].isupper() or len(word) <= 2 for word in cleaned_candidate.split()) or cleaned_candidate.isupper()
-            if len(cleaned_candidate.split()) >= 2 and is_capitalized:
-                extracted_name = validate_candidate(cleaned_candidate, "High-Confidence Name-Label Clean-Up")
-                if extracted_name: break
-
-            
-    # 2. 1st Fallback: Top Lines Heuristic
-    if not extracted_name:
-        for line in lines_top_of_resume:
-            despaced_line = re.sub(r'\s+', ' ', line).strip()
-            
-            aggressively_despaced_name = aggressively_despace_name(line)
-            if aggressively_despaced_name:
-                extracted_name = aggressively_despaced_name
-                break
-            
-            if all(word[0].isupper() or len(word) <= 2 for word in despaced_line.split()) or despaced_line.isupper():
-                extracted_name = validate_candidate(despaced_line, "Top Lines Heuristic - De-Spaced")
-                if extracted_name: break
-                    
-            if not extracted_name and nlp is not None:
-                doc_line = nlp(line) 
-                for ent in doc_line.ents:
-                    if ent.label_ == "PERSON":
-                        extracted_name = validate_candidate(ent.text, "Top Lines Heuristic - SpaCy")
-                        if extracted_name: break
-                if extracted_name: break
-            
-    # 3. 2nd Fallback: Pyresparser Name
-    if not extracted_name:
-        pyresparser_name = parsed_data_pyresparser.get("name", "").strip()
-        if pyresparser_name and pyresparser_name.lower() not in (final_email or "").lower():
-            extracted_name = validate_candidate(pyresparser_name, "Pyresparser Name (2nd Fallback)")
-
-    # 4. NEW: HUGGING FACE NER FALLBACK (High-Accuracy) - Runs with the new, better model
+        extracted_name = extract_name_from_labeled_field(top_lines)
+        if extracted_name:
+            logger.info(f"✓ Name from labeled field: {extracted_name}")
+    
+    # 2. Try name near email
+    if not extracted_name and email:
+        extracted_name = extract_name_near_email(lines, email)
+        if extracted_name:
+            logger.info(f"✓ Name near email: {extracted_name}")
+    
+    # 3. Try Hugging Face NER (high accuracy for resumes)
     if not extracted_name and HF_MODEL_LOADED:
-        hf_extracted_name = extract_name_with_hf_ner(lines_top_of_resume)
-        if hf_extracted_name:
-            extracted_name = validate_candidate(hf_extracted_name, "Hugging Face NER Fallback")
-            if extracted_name:
-                logger.debug(f"Selected name from HF NER Fallback: '{extracted_name}'")
-
-
-    # 5. 3rd Fallback: SpaCy on Full Text (Last Resort)
-    if not extracted_name and nlp is not None:
-        spacy_extracted_name_full = extract_name_with_spacy(full_text_content)
-        if spacy_extracted_name_full:
-            extracted_name = validate_candidate(spacy_extracted_name_full, "SpaCy Full Text (Last Resort)")
-            
-    # 6. LOWEST PRIORITY FALLBACK: Name from Email Address
-    if not extracted_name and final_email:
-        email_prefix = final_email.split('@')[0]
-        cleaned_prefix_separated = re.sub(r'[\d_]', ' ', email_prefix)
-        cleaned_prefix_separated = re.sub(r'[\.-]', ' ', cleaned_prefix_separated).strip()
-        cleaned_prefix_separated = re.sub(r'\s+', ' ', cleaned_prefix_separated) 
-        
-        if is_valid_name_format(cleaned_prefix_separated):
-            extracted_name = cleaned_prefix_separated.title()
-
-        if not extracted_name and len(email_prefix.split()) == 1:
-            merged_name = email_prefix
-            for split in range(4, min(9, len(merged_name) - 3)):
-                candidate_with_space = merged_name[:split] + " " + merged_name[split:]
-                if is_valid_name_format(candidate_with_space):
-                    extracted_name = candidate_with_space.title()
-                    break 
-
-
-    # --- 5.4 FINAL CLEANUP AND RETURN ---
+        extracted_name = extract_name_with_hf_ner(top_lines)
+        if extracted_name:
+            logger.info(f"✓ Name from HF NER: {extracted_name}")
     
-    final_name = str(extracted_name).replace('\n', ' ').strip() if extracted_name else ""
+    # 4. Try first line if it looks like a name
+    if not extracted_name and top_lines:
+        first_line_cleaned = clean_name_string(top_lines[0])
+        if not is_generic_text(first_line_cleaned) and is_valid_name_format(first_line_cleaned):
+            extracted_name = first_line_cleaned
+            logger.info(f"✓ Name from first line: {extracted_name}")
     
-    if final_name:
-        final_name = re.sub(r'\s*\d+$', '', final_name).strip()
+    # 5. Try spaCy on top section
+    if not extracted_name and nlp:
+        top_text = "\n".join(top_lines[:10])
+        spacy_name = extract_name_with_spacy(top_text)
+        if spacy_name:
+            cleaned = clean_name_string(spacy_name)
+            if not is_generic_text(cleaned) and is_valid_name_format(cleaned):
+                extracted_name = cleaned
+                logger.info(f"✓ Name from spaCy: {extracted_name}")
     
-    final_email_cv = str(final_email).replace('\n', ' ').strip() if final_email else ""
-    final_phone_cleaned = str(final_phone).replace('\n', ' ').strip() if final_phone else ""
-
+    # 6. Try PyResParser result
+    if not extracted_name:
+        pyres_name = parsed_data.get("name", "")
+        if pyres_name:
+            cleaned = clean_name_string(pyres_name)
+            if not is_generic_text(cleaned) and is_valid_name_format(cleaned):
+                extracted_name = cleaned
+                logger.info(f"✓ Name from PyResParser: {extracted_name}")
+    
+    # 7. Try filename
+    if not extracted_name:
+        file_name = extract_name_from_filename(filename)
+        if file_name:
+            extracted_name = file_name
+            logger.info(f"✓ Name from filename: {extracted_name}")
+    
+    # 8. Last resort: extract from email
+    if not extracted_name and email:
+        email_prefix = email.split('@')[0]
+        # Split by dots, underscores, hyphens
+        parts = re.split(r'[._-]', email_prefix)
+        if len(parts) >= 2:
+            candidate = ' '.join(parts[:2])  # Take first two parts
+            cleaned = clean_name_string(candidate)
+            if is_valid_name_format(cleaned):
+                extracted_name = cleaned
+                logger.info(f"✓ Name from email (last resort): {extracted_name}")
+    
+    if not extracted_name:
+        logger.warning(f"Could not extract name from resume: {filename}")
+    
+    # Final cleanup
+    final_name = extracted_name if extracted_name else ""
+    
     return {
-        "name"              : final_name,
-        "email_cv"          : final_email_cv,
-        "phone"             : final_phone_cleaned,
-        "skills"            : parsed_data_pyresparser.get("skills", []),
-        "education"         : parsed_data_pyresparser.get("education", []),
-        "experience"        : parsed_data_pyresparser.get("experience", []),
-        "total_experience"  : parsed_data_pyresparser.get("total_experience", 0.0),
-        "full_text_content" : full_text_content or "",
+        "name": final_name,
+        "email_cv": email or "",
+        "phone": phone or "",
+        "skills": parsed_data.get("skills", []),
+        "education": parsed_data.get("education", []),
+        "experience": parsed_data.get("experience", []),
+        "total_experience": parsed_data.get("total_experience", 0.0),
+        "full_text_content": full_text or "",
     }
