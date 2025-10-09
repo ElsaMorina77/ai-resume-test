@@ -16,32 +16,43 @@ try:
     from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
     import torch
     
-    HF_MODEL_ID = "yashpwr/resume-ner-bert-v2" 
+    HF_MODEL_IDS = [
+        "yashpwr/resume-ner-bert-v2", # resume specific BERT
+        "dslim/bert-base-NER", # BERT general purpose NER
+        "Jean-Baptiste/roberta-large-ner-english", # RoBERTa NER 
+        "Davlan/distilbert-base-multilingual-case-ner-hrl", #Multilingual fallback
+        ]
     
-    hf_pipeline = None
-    HF_MODEL_LOADED = False
+    hf_pipelines = {}
+    #HF_MODEL_LOADED = False
     
-    def load_hf_pipeline():
+    def load_hf_pipeline(model_id: str):
         """Loads the Hugging Face model and sets up the pipeline."""
-        global hf_pipeline, HF_MODEL_LOADED
+        #global hf_pipeline, HF_MODEL_LOADED
+        if model_id in hf_pipelines:
+            return hf_pipelines[model_id]
+        
         try:
-            tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID)
-            model = AutoModelForTokenClassification.from_pretrained(HF_MODEL_ID)
-            hf_pipeline = pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
-            HF_MODEL_LOADED = True
-            logger.info(f"Successfully loaded Hugging Face NER model: {HF_MODEL_ID}")
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            model = AutoModelForTokenClassification.from_pretrained(model_id)
+            pipe = pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+            hf_pipelines[model_id] = pipe
+            logger.info(f"Successfully loaded Hugging Face NER model: {model_id}")
+            return pipe
         except Exception as e:
-            logger.warning(f"Failed to load Hugging Face model {HF_MODEL_ID}. Error: {e}")
-            HF_MODEL_LOADED = False
-            hf_pipeline = None
+            logger.warning(f"Failed to load Hugging Face model {model_id}. Error: {e}")
+            #HF_MODEL_LOADED = False
+            #hf_pipeline = None
+            return None
 
-    load_hf_pipeline()
+    #load_hf_pipeline()
 except ImportError:
     logger.warning("Hugging Face (transformers/torch) not installed. Skipping HF fallback.")
-    HF_MODEL_LOADED = False
-except Exception as e:
-    logger.warning(f"An unexpected error occurred during HF model setup: {e}")
-    HF_MODEL_LOADED = False
+    hf_pipelines = {}
+    #HF_MODEL_LOADED = False
+#except Exception as e:
+    #logger.warning(f"An unexpected error occurred during HF model setup: {e}")
+    #HF_MODEL_LOADED = False
 
 # --- 3. SPACY SETUP ---
 nlp = None
@@ -110,59 +121,44 @@ def extract_name_with_spacy(text: str) -> Optional[str]:
     return None
 
 def extract_name_with_hf_ner(lines: List[str]) -> Optional[str]:
-    """Uses the Hugging Face NER pipeline to extract a person's name."""
-    global hf_pipeline
-    if not HF_MODEL_LOADED or hf_pipeline is None:
-        return None
-
-    text_to_analyze = "\n".join(lines[:20])  # Increased window
+    """Try multiple Hugging Face models to extract a name."""
+    text_to_analyze = "\n".join(lines[:100])  # Limit scope
     
-    try:
-        ner_results = hf_pipeline(text_to_analyze)
+    for model_id in HF_MODEL_IDS:
+        pipe = load_hf_pipeline(model_id)
+        if pipe is None:
+            continue
         
-        # Filter for person entities
-        person_entities = []
-        for entity in ner_results:
-            entity_label = entity['entity_group'].upper()
-            if entity_label in ['NAME', 'PER', 'PERSON']:
-                # Clean up tokenization artifacts
-                clean_word = entity['word'].replace('##', '').replace('Ġ', '').strip()
-                if clean_word:
-                    person_entities.append(clean_word)
-        
-        if person_entities:
-            # Try to combine adjacent entities
-            candidates = set()
+        try:
+            ner_results = pipe(text_to_analyze)
+            person_entities = []
+            for entity in ner_results:
+                label = entity['entity_group'].upper()
+                if label in ['NAME', 'PER', 'PERSON']:
+                    clean_word = entity['word'].replace('##', '').replace('Ġ', '').strip()
+                    if clean_word:
+                        person_entities.append(clean_word)
             
-            # Single entities
-            for entity in person_entities:
-                candidates.add(entity)
-            
-            # Two consecutive entities (First + Last name)
-            for i in range(len(person_entities) - 1):
-                combined = f"{person_entities[i]} {person_entities[i+1]}"
-                candidates.add(combined)
-            
-            # Three consecutive entities (First + Middle + Last)
-            for i in range(len(person_entities) - 2):
-                combined = f"{person_entities[i]} {person_entities[i+1]} {person_entities[i+2]}"
-                candidates.add(combined)
+            if person_entities:
+                # Same combining logic as before
+                candidates = set(person_entities)
+                for i in range(len(person_entities) - 1):
+                    candidates.add(f"{person_entities[i]} {person_entities[i+1]}")
+                for i in range(len(person_entities) - 2):
+                    candidates.add(f"{person_entities[i]} {person_entities[i+1]} {person_entities[i+2]}")
+                
+                valid_candidates = [
+                    clean_name_string(cand) for cand in candidates
+                    if is_valid_name_format(clean_name_string(cand))
+                ]
+                
+                if valid_candidates:
+                    best = max(valid_candidates, key=lambda x: len(x.split()))
+                    logger.info(f"✓ Name from {model_id}: {best}")
+                    return best
 
-            # Find best candidate
-            valid_candidates = []
-            for candidate in candidates:
-                cleaned = clean_name_string(candidate)
-                if is_valid_name_format(cleaned):
-                    valid_candidates.append(cleaned)
-            
-            if valid_candidates:
-                # Prefer longer names (more complete)
-                best = max(valid_candidates, key=lambda x: len(x.split()))
-                logger.debug(f"HF NER extracted: {best}")
-                return best
-
-    except Exception as e:
-        logger.error(f"Error during Hugging Face NER inference: {e}")
+        except Exception as e:
+            logger.error(f"Error during inference with {model_id}: {e}")
     
     return None
 
@@ -197,7 +193,7 @@ def is_valid_name_format(name_candidate: str) -> bool:
     words = cleaned.split()
     
     # Must have 2-4 words (First Last, or First Middle Last, etc.)
-    if not (2 <= len(words) <= 4):
+    if not (2 <= len(words) < 4):
         return False
     
     # Each word should be at least 2 characters
@@ -252,7 +248,12 @@ def is_generic_text(text: str) -> bool:
         "full-stack", "front-end", "back-end", "manager", "engineer", "analyst",
         "github", "linkedin", "mobile", "number", "email", "phone", "address",
         "objective", "about me", "references", "work history", "career summary",
-        "technical skills", "personal details", "portfolio", "cover letter"
+        "technical skills", "personal details", "portfolio", "cover letter", "personal information",
+        "recommendations", "certifications", "achievements", "awards", "publications",
+        "languages", "interests", "hobbies", "volunteer", "internship", "troubleshooting enthusiast",
+        "recommendation letter", "leter motivuese", "certificate", "emri dhe mbiemri", "zhvillues softueri",
+        "Xhafer Mustafa Street", "Prishtine", "Kosove", "Rruga", "Nr", "Shkolla e mesme", "Universiteti", "Diplome",
+        "Internal Applications", "Motivationletterlp", "Personal Info", "Xhevdet Doda", "Graphic Designer"
     }
     
     text_lower = text.lower()
@@ -356,7 +357,7 @@ def parse_resume_data(bytes_: bytes, filename: str) -> Dict[str, Any]:
             logger.info(f"✓ Name near email: {extracted_name}")
     
     # 3. Try Hugging Face NER (high accuracy for resumes)
-    if not extracted_name and HF_MODEL_LOADED:
+    if not extracted_name and hf_pipelines:
         extracted_name = extract_name_with_hf_ner(top_lines)
         if extracted_name:
             logger.info(f"✓ Name from HF NER: {extracted_name}")
